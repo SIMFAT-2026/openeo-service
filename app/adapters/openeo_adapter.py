@@ -1,4 +1,5 @@
 from uuid import UUID
+from typing import Any
 
 from app.clients.openeo_client import OpenEOClient
 from app.core.config import get_settings
@@ -17,3 +18,9 @@ class OpenEOAdapter:
 
     def create_job(self, indicator_type: IndicatorType, payload: IndicatorJobRequest) -> UUID:
         return self.client.submit_indicator_job(indicator_type=indicator_type, payload=payload)
+
+    def get_capabilities(self) -> dict[str, Any]:
+        return self.client.fetch_capabilities()
+
+    def get_collections(self, limit: int) -> dict[str, Any]:
+        return self.client.fetch_collections(limit=limit)

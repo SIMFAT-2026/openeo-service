@@ -98,6 +98,16 @@ uvicorn app.main:app --reload --port ${APP_PORT}
 - `GET /config/check`
 - `POST /jobs/ndvi`
 - `POST /jobs/ndmi`
+- `GET /openeo/capabilities`
+- `GET /openeo/collections?limit=5`
+
+## Verificacion liviana de conexion openEO
+
+Los endpoints `GET /openeo/capabilities` y `GET /openeo/collections` estan orientados a pruebas de conectividad de bajo costo.
+
+- Usan timeout corto.
+- Cachean respuestas por 5 minutos.
+- Cachean token de acceso segun su expiracion.
 
 ## Ejemplo rapido de request (placeholder)
 

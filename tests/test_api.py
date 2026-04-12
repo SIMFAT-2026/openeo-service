@@ -1,6 +1,8 @@
 from fastapi.testclient import TestClient
 
+from app.api.routes import openeo as openeo_routes
 from app.main import app
+from app.schemas.openeo import OpenEOCapabilitiesResponse, OpenEOCollectionsResponse
 
 client = TestClient(app)
 
@@ -33,3 +35,35 @@ def test_ndvi_placeholder_accepts_request() -> None:
     assert body["indicatorType"] == "NDVI"
     assert body["status"] == "accepted"
     assert body["source"] == "openEO"
+
+
+def test_openeo_capabilities_endpoint_exists(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    def fake_capabilities() -> OpenEOCapabilitiesResponse:
+        return OpenEOCapabilitiesResponse(
+            cached=False,
+            fetchedAt="2026-04-10T00:00:00Z",
+            data={"api_version": "1.2.0"},
+        )
+
+    monkeypatch.setattr(openeo_routes.service, "get_capabilities", fake_capabilities)
+    response = client.get("/openeo/capabilities")
+    assert response.status_code == 200
+    assert response.json()["source"] == "openEO"
+
+
+def test_openeo_collections_endpoint_exists(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    def fake_collections(limit: int) -> OpenEOCollectionsResponse:
+        return OpenEOCollectionsResponse(
+            cached=False,
+            fetchedAt="2026-04-10T00:00:00Z",
+            limit=limit,
+            count=1,
+            collections=[{"id": "SENTINEL2_L2A"}],
+        )
+
+    monkeypatch.setattr(openeo_routes.service, "get_collections", fake_collections)
+    response = client.get("/openeo/collections?limit=5")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["limit"] == 5
+    assert body["count"] == 1

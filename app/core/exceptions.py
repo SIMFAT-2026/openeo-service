@@ -19,6 +19,15 @@ class ValidationError(AppError):
         )
 
 
+class ExternalServiceError(AppError):
+    def __init__(self, message: str, status_code: int = status.HTTP_502_BAD_GATEWAY) -> None:
+        super().__init__(
+            message=message,
+            code="EXTERNAL_SERVICE_ERROR",
+            status_code=status_code,
+        )
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def app_error_handler(_: Request, exc: AppError) -> JSONResponse:
