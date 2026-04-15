@@ -14,10 +14,17 @@ class OpenEOClient:
     Placeholder client for future real integration with openEO/Copernicus API.
     """
 
-    def __init__(self, base_url: str, client_id: str, client_secret: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        client_id: str,
+        client_secret: str,
+        access_token: str = "",
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.client_id = client_id
         self.client_secret = client_secret
+        self.access_token = access_token.strip()
         self.identity_token_url = (
             "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
         )
@@ -94,6 +101,68 @@ class OpenEOClient:
         self._set_cached_response(cache_key, payload, ttl_seconds=300)
         return payload
 
+    def fetch_indicator_latest(
+        self,
+        indicator_type: IndicatorType,
+        payload: IndicatorJobRequest,
+    ) -> dict[str, Any]:
+        if not payload.aoi or payload.aoi.type != "bbox" or len(payload.aoi.coordinates) != 4:
+            raise ExternalServiceError("A bbox aoi with 4 coordinates is required to query indicator values", 400)
+
+        cache_key = (
+            f"indicator:{indicator_type.value}:{payload.period_start.isoformat()}:{payload.period_end.isoformat()}:"
+            f"{','.join(str(v) for v in payload.aoi.coordinates)}"
+        )
+        cached_value = self._get_cached_response(cache_key)
+        if cached_value:
+            return cached_value
+
+        token = self._get_processing_access_token()
+        api_base_url = self._resolve_api_base_url()
+        bbox = self._build_spatial_extent(payload.aoi.coordinates)
+        polygon = self._bbox_to_polygon(payload.aoi.coordinates)
+        process_graph = self._build_indicator_process_graph(
+            indicator_type=indicator_type,
+            temporal_extent=[payload.period_start.isoformat(), payload.period_end.isoformat()],
+            spatial_extent=bbox,
+            polygon=polygon,
+        )
+
+        try:
+            with httpx.Client(timeout=60) as client:
+                response = client.post(
+                    f"{api_base_url}/result",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"process": {"process_graph": process_graph}},
+                )
+        except httpx.HTTPError as exc:
+            raise ExternalServiceError(f"openEO connectivity error while loading indicator value: {exc}") from exc
+
+        if response.status_code >= 400:
+            message = self._extract_openeo_error(response)
+            raise ExternalServiceError(
+                f"openEO indicator request failed with status {response.status_code}: {message}"
+            )
+
+        measured_value = self._extract_first_numeric(response)
+        now = datetime.now(timezone.utc)
+        result = {
+            "cached": False,
+            "fetchedAt": now,
+            "measuredAt": now,
+            "indicatorType": indicator_type.value,
+            "regionId": payload.region_id,
+            "periodStart": payload.period_start,
+            "periodEnd": payload.period_end,
+            "collectionId": "SENTINEL2_L2A",
+            "value": measured_value,
+        }
+        self._set_cached_response(cache_key, result, ttl_seconds=300)
+        return result
+
     def _get_access_token(self) -> str:
         cached_token = self._token_cache.get("access_token")
         expires_at = self._token_cache.get("expires_at")
@@ -128,6 +197,150 @@ class OpenEOClient:
         self._token_cache["access_token"] = access_token
         self._token_cache["expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=safe_ttl)
         return access_token
+
+    def _get_processing_access_token(self) -> str:
+        if self.access_token:
+            return self.access_token
+
+        raise ExternalServiceError(
+            "OPENEO_ACCESS_TOKEN is required for processing endpoints "
+            "(/result, /jobs). The configured client_credentials token only supports metadata probes in CDSE."
+        )
+
+    def _build_spatial_extent(self, bbox: list[float]) -> dict[str, Any]:
+        return {
+            "west": bbox[0],
+            "south": bbox[1],
+            "east": bbox[2],
+            "north": bbox[3],
+            "crs": "EPSG:4326",
+        }
+
+    def _bbox_to_polygon(self, bbox: list[float]) -> dict[str, Any]:
+        west, south, east, north = bbox
+        return {
+            "type": "Polygon",
+            "coordinates": [
+                [
+                    [west, south],
+                    [east, south],
+                    [east, north],
+                    [west, north],
+                    [west, south],
+                ]
+            ],
+        }
+
+    def _build_indicator_process_graph(
+        self,
+        indicator_type: IndicatorType,
+        temporal_extent: list[str],
+        spatial_extent: dict[str, Any],
+        polygon: dict[str, Any],
+    ) -> dict[str, Any]:
+        if indicator_type == IndicatorType.NDVI:
+            nir_band = "B08"
+            red_band = "B04"
+        else:
+            nir_band = "B08"
+            red_band = "B11"
+
+        mean_reducer = {
+            "process_graph": {
+                "mean1": {
+                    "process_id": "mean",
+                    "arguments": {"data": {"from_parameter": "data"}},
+                    "result": True,
+                }
+            }
+        }
+        return {
+            "load_collection": {
+                "process_id": "load_collection",
+                "arguments": {
+                    "id": "SENTINEL2_L2A",
+                    "spatial_extent": spatial_extent,
+                    "temporal_extent": temporal_extent,
+                    "bands": [red_band, nir_band],
+                },
+            },
+            "index": {
+                "process_id": "ndvi",
+                "arguments": {
+                    "data": {"from_node": "load_collection"},
+                    "nir": nir_band,
+                    "red": red_band,
+                },
+            },
+            "aggregate_spatial": {
+                "process_id": "aggregate_spatial",
+                "arguments": {
+                    "data": {"from_node": "index"},
+                    "geometries": polygon,
+                    "reducer": mean_reducer,
+                },
+            },
+            "reduce_time": {
+                "process_id": "reduce_dimension",
+                "arguments": {
+                    "data": {"from_node": "aggregate_spatial"},
+                    "dimension": "t",
+                    "reducer": mean_reducer,
+                },
+            },
+            "save": {
+                "process_id": "save_result",
+                "arguments": {
+                    "data": {"from_node": "reduce_time"},
+                    "format": "JSON",
+                },
+                "result": True,
+            },
+        }
+
+    def _extract_openeo_error(self, response: httpx.Response) -> str:
+        try:
+            payload = response.json()
+        except ValueError:
+            return response.text[:300]
+
+        if isinstance(payload, dict):
+            if isinstance(payload.get("message"), str):
+                return payload["message"]
+            errors = payload.get("errors")
+            if isinstance(errors, list) and errors:
+                first = errors[0]
+                if isinstance(first, dict) and isinstance(first.get("message"), str):
+                    return first["message"]
+        return str(payload)[:300]
+
+    def _extract_first_numeric(self, response: httpx.Response) -> float | None:
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+
+        value = self._extract_numeric_recursive(payload)
+        return float(value) if value is not None else None
+
+    def _extract_numeric_recursive(self, payload: Any) -> float | int | None:
+        if isinstance(payload, bool):
+            return None
+        if isinstance(payload, (float, int)):
+            return payload
+        if isinstance(payload, list):
+            for item in payload:
+                value = self._extract_numeric_recursive(item)
+                if value is not None:
+                    return value
+            return None
+        if isinstance(payload, dict):
+            for item in payload.values():
+                value = self._extract_numeric_recursive(item)
+                if value is not None:
+                    return value
+            return None
+        return None
 
     def _get_cached_response(self, key: str) -> dict[str, Any] | None:
         item = self._response_cache.get(key)

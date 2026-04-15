@@ -14,6 +14,7 @@ class OpenEOAdapter:
             base_url=settings.openeo_base_url,
             client_id=settings.openeo_client_id,
             client_secret=settings.openeo_client_secret,
+            access_token=settings.openeo_access_token,
         )
 
     def create_job(self, indicator_type: IndicatorType, payload: IndicatorJobRequest) -> UUID:
@@ -24,3 +25,10 @@ class OpenEOAdapter:
 
     def get_collections(self, limit: int) -> dict[str, Any]:
         return self.client.fetch_collections(limit=limit)
+
+    def get_indicator_latest(
+        self,
+        indicator_type: IndicatorType,
+        payload: IndicatorJobRequest,
+    ) -> dict[str, Any]:
+        return self.client.fetch_indicator_latest(indicator_type=indicator_type, payload=payload)

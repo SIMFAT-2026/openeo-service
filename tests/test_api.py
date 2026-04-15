@@ -67,3 +67,36 @@ def test_openeo_collections_endpoint_exists(monkeypatch) -> None:  # type: ignor
     body = response.json()
     assert body["limit"] == 5
     assert body["count"] == 1
+
+
+def test_openeo_indicator_latest_endpoint_exists(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    def fake_indicator_latest(indicator_type, payload):  # type: ignore[no-untyped-def]
+        _ = (indicator_type, payload)
+        return {
+            "status": "ok",
+            "source": "openEO",
+            "cached": False,
+            "fetchedAt": "2026-04-12T00:00:00Z",
+            "measuredAt": "2026-04-12T00:00:00Z",
+            "indicatorType": "NDVI",
+            "regionId": "region-001",
+            "periodStart": "2026-04-01",
+            "periodEnd": "2026-04-12",
+            "collectionId": "SENTINEL2_L2A",
+            "value": 0.42,
+        }
+
+    monkeypatch.setattr(openeo_routes.service, "get_indicator_latest", fake_indicator_latest)
+    response = client.post(
+        "/openeo/indicators/latest/NDVI",
+        json={
+            "regionId": "region-001",
+            "aoi": {"type": "bbox", "coordinates": [-72.6, -38.8, -72.3, -38.5]},
+            "periodStart": "2026-04-01",
+            "periodEnd": "2026-04-12",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["indicatorType"] == "NDVI"
+    assert body["collectionId"] == "SENTINEL2_L2A"

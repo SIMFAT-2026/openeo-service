@@ -1,6 +1,12 @@
 from fastapi import APIRouter, Query
 
-from app.schemas.openeo import OpenEOCapabilitiesResponse, OpenEOCollectionsResponse
+from app.models.job import IndicatorType
+from app.schemas.jobs import IndicatorJobRequest
+from app.schemas.openeo import (
+    OpenEOCapabilitiesResponse,
+    OpenEOCollectionsResponse,
+    OpenEOIndicatorLatestResponse,
+)
 from app.services.openeo_probe_service import OpenEOProbeService
 
 router = APIRouter(prefix="/openeo", tags=["openeo"])
@@ -15,3 +21,11 @@ def get_capabilities() -> OpenEOCapabilitiesResponse:
 @router.get("/collections", response_model=OpenEOCollectionsResponse)
 def get_collections(limit: int = Query(default=5, ge=1, le=20)) -> OpenEOCollectionsResponse:
     return service.get_collections(limit=limit)
+
+
+@router.post("/indicators/latest/{indicator}", response_model=OpenEOIndicatorLatestResponse)
+def get_indicator_latest(
+    indicator: IndicatorType,
+    payload: IndicatorJobRequest,
+) -> OpenEOIndicatorLatestResponse:
+    return service.get_indicator_latest(indicator_type=indicator, payload=payload)

@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     openeo_base_url: str = Field(default="", alias="OPENEO_BASE_URL")
     openeo_client_id: str = Field(default="", alias="OPENEO_CLIENT_ID")
     openeo_client_secret: str = Field(default="", alias="OPENEO_CLIENT_SECRET")
+    openeo_access_token: str = Field(default="", alias="OPENEO_ACCESS_TOKEN")
 
     simfat_backend_url: str = Field(default="", alias="SIMFAT_BACKEND_URL")
 
