@@ -5,6 +5,7 @@ from app.schemas.jobs import IndicatorJobRequest
 from app.schemas.openeo import (
     OpenEOCapabilitiesResponse,
     OpenEOCollectionsResponse,
+    OpenEOIndicatorDailyUIResponse,
     OpenEOIndicatorLatestResponse,
 )
 from app.services.openeo_probe_service import OpenEOProbeService
@@ -29,3 +30,11 @@ def get_indicator_latest(
     payload: IndicatorJobRequest,
 ) -> OpenEOIndicatorLatestResponse:
     return service.get_indicator_latest(indicator_type=indicator, payload=payload)
+
+
+@router.post("/ui/daily/{indicator}", response_model=OpenEOIndicatorDailyUIResponse)
+def get_indicator_daily_ui(
+    indicator: IndicatorType,
+    payload: IndicatorJobRequest,
+) -> OpenEOIndicatorDailyUIResponse:
+    return service.get_indicator_daily_ui(indicator_type=indicator, payload=payload)
