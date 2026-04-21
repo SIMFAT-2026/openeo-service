@@ -15,6 +15,9 @@ class OpenEOAdapter:
             client_id=settings.openeo_client_id,
             client_secret=settings.openeo_client_secret,
             access_token=settings.openeo_access_token,
+            refresh_token=settings.openeo_refresh_token,
+            refresh_client_id=settings.openeo_refresh_client_id,
+            refresh_client_secret=settings.openeo_refresh_client_secret,
         )
 
     def create_job(self, indicator_type: IndicatorType, payload: IndicatorJobRequest) -> UUID:

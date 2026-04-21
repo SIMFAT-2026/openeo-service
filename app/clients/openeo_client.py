@@ -1,4 +1,8 @@
+import base64
+import json
+import time
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -20,15 +24,23 @@ class OpenEOClient:
         client_id: str,
         client_secret: str,
         access_token: str = "",
+        refresh_token: str = "",
+        refresh_client_id: str = "",
+        refresh_client_secret: str = "",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.client_id = client_id
         self.client_secret = client_secret
         self.access_token = access_token.strip()
+        self.refresh_token = refresh_token.strip()
+        self.refresh_client_id = refresh_client_id.strip()
+        self.refresh_client_secret = refresh_client_secret.strip()
         self.identity_token_url = (
             "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
         )
         self.timeout_seconds = 10
+        self.max_retries = 2
+        self.base_backoff_seconds = 1.0
         self._token_cache: dict[str, Any] = {}
         self._response_cache: dict[str, Any] = {}
         self._api_base_url_cache: dict[str, Any] = {}
@@ -47,13 +59,19 @@ class OpenEOClient:
         url = f"{self.base_url}/.well-known/openeo"
         try:
             with httpx.Client(timeout=self.timeout_seconds) as client:
-                response = client.get(url, headers={"Authorization": f"Bearer {token}"})
+                response = self._request_with_retry(
+                    client=client,
+                    method="GET",
+                    url=url,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
         except httpx.HTTPError as exc:
             raise ExternalServiceError(f"openEO connectivity error while loading capabilities: {exc}") from exc
 
         if response.status_code >= 400:
             raise ExternalServiceError(
-                f"openEO capabilities request failed with status {response.status_code}"
+                f"openEO capabilities request failed with status {response.status_code}",
+                status_code=response.status_code,
             )
 
         payload = {
@@ -75,8 +93,10 @@ class OpenEOClient:
         url = f"{api_base_url}/collections"
         try:
             with httpx.Client(timeout=self.timeout_seconds) as client:
-                response = client.get(
-                    url,
+                response = self._request_with_retry(
+                    client=client,
+                    method="GET",
+                    url=url,
                     params={"limit": limit},
                     headers={"Authorization": f"Bearer {token}"},
                 )
@@ -85,7 +105,8 @@ class OpenEOClient:
 
         if response.status_code >= 400:
             raise ExternalServiceError(
-                f"openEO collections request failed with status {response.status_code}"
+                f"openEO collections request failed with status {response.status_code}",
+                status_code=response.status_code,
             )
 
         data = response.json()
@@ -130,10 +151,12 @@ class OpenEOClient:
 
         try:
             with httpx.Client(timeout=60) as client:
-                response = client.post(
-                    f"{api_base_url}/result",
+                response = self._request_with_retry(
+                    client=client,
+                    method="POST",
+                    url=f"{api_base_url}/result",
                     headers={
-                        "Authorization": f"Bearer {token}",
+                        "Authorization": f"Bearer {self._format_oidc_token(token)}",
                         "Content-Type": "application/json",
                     },
                     json={"process": {"process_graph": process_graph}},
@@ -144,7 +167,8 @@ class OpenEOClient:
         if response.status_code >= 400:
             message = self._extract_openeo_error(response)
             raise ExternalServiceError(
-                f"openEO indicator request failed with status {response.status_code}: {message}"
+                f"openEO indicator request failed with status {response.status_code}: {message}",
+                status_code=response.status_code,
             )
 
         measured_value = self._extract_first_numeric(response)
@@ -171,8 +195,10 @@ class OpenEOClient:
 
         try:
             with httpx.Client(timeout=self.timeout_seconds) as client:
-                response = client.post(
-                    self.identity_token_url,
+                response = self._request_with_retry(
+                    client=client,
+                    method="POST",
+                    url=self.identity_token_url,
                     data={
                         "grant_type": "client_credentials",
                         "client_id": self.client_id,
@@ -184,7 +210,8 @@ class OpenEOClient:
 
         if response.status_code >= 400:
             raise ExternalServiceError(
-                f"Identity token request failed with status {response.status_code}"
+                f"Identity token request failed with status {response.status_code}",
+                status_code=response.status_code,
             )
 
         payload = response.json()
@@ -199,13 +226,97 @@ class OpenEOClient:
         return access_token
 
     def _get_processing_access_token(self) -> str:
-        if self.access_token:
+        if self.access_token and not self._is_token_expired(self.access_token):
             return self.access_token
 
+        if self.refresh_token:
+            return self._refresh_processing_access_token()
+
         raise ExternalServiceError(
-            "OPENEO_ACCESS_TOKEN is required for processing endpoints "
-            "(/result, /jobs). The configured client_credentials token only supports metadata probes in CDSE."
+            "A valid processing token is required for /result and /jobs. "
+            "Configure OPENEO_ACCESS_TOKEN (short-lived) or OPENEO_REFRESH_TOKEN (recommended for auto-renewal). "
+            "The configured client_credentials token only supports metadata probes in CDSE."
         )
+
+    def _refresh_processing_access_token(self) -> str:
+        cached_token = self._token_cache.get("processing_access_token")
+        expires_at = self._token_cache.get("processing_expires_at")
+        if cached_token and expires_at and datetime.now(timezone.utc) < expires_at:
+            return cached_token
+
+        token = self._request_token_by_refresh_token()
+        return token
+
+    def _request_token_by_refresh_token(self) -> str:
+        client_id = self.refresh_client_id or self.client_id
+        client_secret = self.refresh_client_secret
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": self.refresh_token,
+            "client_id": client_id,
+        }
+        if client_secret:
+            data["client_secret"] = client_secret
+
+        try:
+            with httpx.Client(timeout=self.timeout_seconds) as client:
+                response = self._request_with_retry(
+                    client=client,
+                    method="POST",
+                    url=self.identity_token_url,
+                    data=data,
+                )
+        except httpx.HTTPError as exc:
+            raise ExternalServiceError(f"Identity connectivity error while refreshing token: {exc}") from exc
+
+        if response.status_code >= 400:
+            detail = self._extract_openeo_error(response)
+            raise ExternalServiceError(
+                f"Identity refresh token request failed with status {response.status_code}: {detail}",
+                status_code=response.status_code,
+            )
+
+        payload = response.json()
+        access_token = payload.get("access_token")
+        if not access_token:
+            raise ExternalServiceError("Identity refresh token response did not include access_token")
+
+        expires_in = int(payload.get("expires_in", 1800))
+        safe_ttl = max(expires_in - 60, 60)
+        self._token_cache["processing_access_token"] = access_token
+        self._token_cache["processing_expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=safe_ttl)
+
+        # If the provider rotates refresh tokens, keep it in memory for this process.
+        rotated_refresh_token = payload.get("refresh_token")
+        if isinstance(rotated_refresh_token, str) and rotated_refresh_token.strip():
+            self.refresh_token = rotated_refresh_token.strip()
+
+        return access_token
+
+    def _is_token_expired(self, token: str) -> bool:
+        exp = self._read_token_exp(token)
+        if exp is None:
+            return True
+        # Consider token expired one minute earlier to reduce near-expiry failures.
+        return datetime.now(timezone.utc) >= (exp - timedelta(seconds=60))
+
+    def _read_token_exp(self, token: str) -> datetime | None:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return None
+
+        payload = parts[1]
+        padding = "=" * (-len(payload) % 4)
+        payload = payload.replace("-", "+").replace("_", "/") + padding
+        try:
+            decoded = base64.b64decode(payload)
+            data = json.loads(decoded.decode("utf-8"))
+            exp_raw = data.get("exp")
+            if exp_raw is None:
+                return None
+            return datetime.fromtimestamp(int(exp_raw), tz=timezone.utc)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return None
 
     def _build_spatial_extent(self, bbox: list[float]) -> dict[str, Any]:
         return {
@@ -272,26 +383,26 @@ class OpenEOClient:
                     "red": red_band,
                 },
             },
-            "aggregate_spatial": {
-                "process_id": "aggregate_spatial",
-                "arguments": {
-                    "data": {"from_node": "index"},
-                    "geometries": polygon,
-                    "reducer": mean_reducer,
-                },
-            },
             "reduce_time": {
                 "process_id": "reduce_dimension",
                 "arguments": {
-                    "data": {"from_node": "aggregate_spatial"},
+                    "data": {"from_node": "index"},
                     "dimension": "t",
+                    "reducer": mean_reducer,
+                },
+            },
+            "aggregate_spatial": {
+                "process_id": "aggregate_spatial",
+                "arguments": {
+                    "data": {"from_node": "reduce_time"},
+                    "geometries": polygon,
                     "reducer": mean_reducer,
                 },
             },
             "save": {
                 "process_id": "save_result",
                 "arguments": {
-                    "data": {"from_node": "reduce_time"},
+                    "data": {"from_node": "aggregate_spatial"},
                     "format": "JSON",
                 },
                 "result": True,
@@ -371,12 +482,19 @@ class OpenEOClient:
         discovery_url = f"{self.base_url}/.well-known/openeo"
         try:
             with httpx.Client(timeout=self.timeout_seconds) as client:
-                response = client.get(discovery_url)
+                response = self._request_with_retry(
+                    client=client,
+                    method="GET",
+                    url=discovery_url,
+                )
         except httpx.HTTPError as exc:
             raise ExternalServiceError(f"openEO discovery connectivity error: {exc}") from exc
 
         if response.status_code >= 400:
-            raise ExternalServiceError(f"openEO discovery request failed with status {response.status_code}")
+            raise ExternalServiceError(
+                f"openEO discovery request failed with status {response.status_code}",
+                status_code=response.status_code,
+            )
 
         versions = response.json().get("versions", [])
         production_versions = [entry for entry in versions if entry.get("production") is True]
@@ -398,3 +516,63 @@ class OpenEOClient:
             "expires_at": datetime.now(timezone.utc) + timedelta(hours=1),
         }
         return selected_url
+
+    def _format_oidc_token(self, access_token: str) -> str:
+        token = access_token.strip()
+        if token.startswith("oidc/"):
+            return token
+        # CDSE openEO expects OIDC provider-qualified bearer tokens.
+        return f"oidc/CDSE/{token}"
+
+    def _request_with_retry(
+        self,
+        client: httpx.Client,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        attempt = 0
+        response: httpx.Response | None = None
+        while attempt <= self.max_retries:
+            response = client.request(method=method, url=url, **kwargs)
+            if response.status_code < 400:
+                return response
+            if not self._is_retryable_status(response.status_code) or attempt >= self.max_retries:
+                return response
+
+            delay = self._compute_retry_delay(response=response, attempt=attempt)
+            if delay > 0:
+                time.sleep(delay)
+            attempt += 1
+
+        return response if response is not None else client.request(method=method, url=url, **kwargs)
+
+    def _is_retryable_status(self, status_code: int) -> bool:
+        return status_code in {429, 502, 503, 504}
+
+    def _compute_retry_delay(self, response: httpx.Response, attempt: int) -> float:
+        retry_after_header = response.headers.get("Retry-After")
+        retry_after = self._parse_retry_after(retry_after_header)
+        if retry_after is not None:
+            return max(retry_after, 0.0)
+        return self.base_backoff_seconds * (2**attempt)
+
+    def _parse_retry_after(self, header_value: str | None) -> float | None:
+        if not header_value:
+            return None
+        value = header_value.strip()
+        if not value:
+            return None
+
+        if value.isdigit():
+            return float(value)
+
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        delta = retry_at - datetime.now(timezone.utc)
+        return max(delta.total_seconds(), 0.0)
